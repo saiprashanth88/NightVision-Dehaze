@@ -185,17 +185,62 @@ def classic_enhancement(rgb, strength=0.45):
     return to_float(out)
 
 
-def postprocess_image(rgb01, strength=0.45):
+def postprocess_image(rgb01, strength=0.45, brightness=0.45, dehaze=0.30):
+    """
+    Local-only classical refinement after the trained model.
+    Brightness uses adaptive gamma; haze refinement uses a conservative dark-channel
+    estimate blended with CLAHE contrast. This is a heuristic, not a learned model.
+    """
     img = to_uint8(rgb01)
-    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    base = img.copy()
+
+    # Adaptive gamma lift: darker images get a stronger lift; bright scenes are protected.
+    gray_mean = float(cv2.cvtColor(base, cv2.COLOR_RGB2GRAY).mean()) / 255.0
+    lift = float(np.clip(brightness, 0.0, 1.0))
+    darkness = float(np.clip((0.62 - gray_mean) / 0.62, 0.0, 1.0))
+    gamma = float(np.clip(1.0 - 0.62 * lift * darkness, 0.48, 1.0))
+    lut = np.array([round(((i / 255.0) ** gamma) * 255) for i in range(256)], dtype=np.uint8)
+    brightened = cv2.LUT(base, lut)
+
+    # Conservative dark-channel dehazing. Keep strength modest for night scenes,
+    # where headlights and street lamps can confuse atmospheric-light estimation.
+    haze_strength = float(np.clip(dehaze, 0.0, 1.0))
+    if haze_strength > 0.001:
+        f = brightened.astype(np.float32) / 255.0
+        min_rgb = np.min(f, axis=2)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        dark = cv2.erode(min_rgb, kernel)
+
+        flat_dark = dark.reshape(-1)
+        flat_img = f.reshape(-1, 3)
+        count = max(1, int(flat_dark.size * 0.001))
+        indices = np.argpartition(flat_dark, -count)[-count:]
+        atmosphere = np.max(flat_img[indices], axis=0)
+        atmosphere = np.clip(atmosphere, 0.55, 1.0)
+
+        normalized = f / atmosphere.reshape(1, 1, 3)
+        normalized_dark = np.min(normalized, axis=2)
+        dark_norm = cv2.erode(normalized_dark, kernel)
+        transmission = np.clip(1.0 - 0.55 * dark_norm, 0.50, 1.0)
+        restored = (f - atmosphere.reshape(1, 1, 3)) / transmission[..., None] + atmosphere.reshape(1, 1, 3)
+        restored = np.clip(restored, 0.0, 1.0)
+        alpha = 0.45 * haze_strength
+        dehazed = np.clip((1.0 - alpha) * f + alpha * restored, 0.0, 1.0)
+        brightened = to_uint8(dehazed)
+
+    # Local contrast enhancement in LAB, blended conservatively.
+    lab = cv2.cvtColor(brightened, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=1.4, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=1.0 + 1.8 * haze_strength, tileGridSize=(8, 8))
     l2 = clahe.apply(l)
     contrast = cv2.cvtColor(cv2.merge((l2, a, b)), cv2.COLOR_LAB2RGB)
+
+    # Subtle sharpening only; avoid amplifying sensor noise.
     blur = cv2.GaussianBlur(contrast, (0, 0), 1.0)
-    sharp = cv2.addWeighted(contrast, 1.10, blur, -0.10, 0)
-    alpha = float(np.clip(strength, 0, 1))
-    return to_float(cv2.addWeighted(img, 1.0 - alpha, sharp, alpha, 0))
+    sharp = cv2.addWeighted(contrast, 1.08, blur, -0.08, 0)
+    alpha = float(np.clip(strength, 0.0, 1.0))
+    refined = cv2.addWeighted(brightened, 1.0 - alpha, sharp, alpha, 0)
+    return to_float(refined)
 
 
 def image_metrics(rgb01):
@@ -365,7 +410,11 @@ with st.sidebar:
     if model is None:
         st.warning("The trained checkpoint is not available. The app will use a classical OpenCV fallback for the demo.")
         st.caption("The fallback is not your trained CNN + Transformer model.")
-    strength = st.slider("Post-processing strength", 0.0, 1.0, 0.45, 0.05)
+    strength = st.slider("Contrast / detail refinement", 0.0, 1.0, 0.45, 0.05)
+    brightness_strength = st.slider("Local brightness lift", 0.0, 1.0, 0.45, 0.05,
+                                    help="Adaptive gamma brightening; stronger for darker input images.")
+    dehaze_strength = st.slider("Classical haze refinement", 0.0, 1.0, 0.30, 0.05,
+                                help="Conservative local dark-channel dehazing plus contrast. Lower values are safer around headlights.")
     show_intermediate = st.checkbox("Show all processing stages", value=True)
     st.markdown("---")
     st.subheader("Temporary Gemini demo layer")
@@ -487,7 +536,7 @@ else:
                 # Expose six clearly named, reproducible visual stages.
                 condition_visual = to_float(condition["overlay"])
                 feature_fusion = np.clip(0.75 * model_out + 0.25 * pre01, 0.0, 1.0)
-                final = postprocess_image(feature_fusion, strength)
+                final = postprocess_image(feature_fusion, strength, brightness_strength, dehaze_strength)
                 stages = {
                     "Input": original01,
                     "Preprocessing": pre01,
