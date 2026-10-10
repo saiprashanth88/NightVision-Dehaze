@@ -4,6 +4,7 @@ import io
 import cv2
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
 import torch
 from PIL import Image
@@ -161,45 +162,88 @@ def png_bytes(rgb01):
     return encoded.tobytes() if ok else b""
 
 
-def show_metric_graphs(stages, reference=None):
-    st.markdown("### Image-quality graphs")
-    metric_rows = []
-    psnr_rows = []
-    ssim_rows = []
-    for name, arr in stages.items():
-        m = image_metrics(arr)
-        metric_rows.append({"Stage": name, **m})
-        if reference is not None:
-            p, s = reference_metrics(to_uint8(arr), reference)
-            psnr_rows.append({"Stage": name, "PSNR (dB)": p})
-            ssim_rows.append({"Stage": name, "SSIM": s})
+def show_metric_graphs(input_rgb, output_rgb):
+    """Colorful, easy-to-read input-vs-output charts; no sidebar reference upload needed."""
+    st.markdown("## 📊 Input vs. Enhanced Output — Visual Comparison")
 
-    metric_df = pd.DataFrame(metric_rows).set_index("Stage")
+    input01 = to_float(input_rgb)
+    output01 = to_float(output_rgb)
+    before = image_metrics(input01)
+    after = image_metrics(output01)
+
+    # Extra interpretable image statistics.
+    before_gray = cv2.cvtColor(input_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    after_gray = cv2.cvtColor(output_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    before_brightness = float(before_gray.mean())
+    after_brightness = float(after_gray.mean())
+    before_contrast = float(before_gray.std())
+    after_contrast = float(after_gray.std())
+    before_saturation = float(cv2.cvtColor(input_rgb, cv2.COLOR_RGB2HSV)[:, :, 1].mean())
+    after_saturation = float(cv2.cvtColor(output_rgb, cv2.COLOR_RGB2HSV)[:, :, 1].mean())
+
+    labels = ["Input", "Enhanced output"]
+    palette = ["#3498db", "#2ecc71"]
+
+    left, right = st.columns(2)
+    with left:
+        fig, ax = plt.subplots(figsize=(6.2, 3.8))
+        bars = ax.bar(labels, [before["Sharpness (Laplacian variance)"], after["Sharpness (Laplacian variance)"]], color=palette, width=0.58)
+        ax.set_title("Sharpness comparison", fontweight="bold")
+        ax.set_ylabel("Laplacian variance")
+        ax.grid(axis="y", alpha=0.25)
+        ax.bar_label(bars, fmt="%.2f", padding=4, fontsize=9)
+        fig.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+    with right:
+        fig, ax = plt.subplots(figsize=(6.2, 3.8))
+        bars = ax.bar(labels, [before_contrast, after_contrast], color=palette, width=0.58)
+        ax.set_title("Contrast comparison", fontweight="bold")
+        ax.set_ylabel("Grayscale standard deviation (0–1)")
+        ax.grid(axis="y", alpha=0.25)
+        ax.bar_label(bars, fmt="%.3f", padding=4, fontsize=9)
+        fig.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+    left, right = st.columns(2)
+    with left:
+        fig, ax = plt.subplots(figsize=(6.2, 3.8))
+        bars = ax.bar(labels, [before_brightness, after_brightness], color=["#f39c12", "#8e44ad"], width=0.58)
+        ax.set_title("Brightness comparison", fontweight="bold")
+        ax.set_ylabel("Mean grayscale brightness (0–1)")
+        ax.set_ylim(0, 1)
+        ax.grid(axis="y", alpha=0.25)
+        ax.bar_label(bars, fmt="%.3f", padding=4, fontsize=9)
+        fig.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+    with right:
+        fig, ax = plt.subplots(figsize=(6.2, 3.8))
+        bars = ax.bar(labels, [before_saturation, after_saturation], color=["#e67e22", "#16a085"], width=0.58)
+        ax.set_title("Color saturation comparison", fontweight="bold")
+        ax.set_ylabel("Mean HSV saturation (0–255)")
+        ax.grid(axis="y", alpha=0.25)
+        ax.bar_label(bars, fmt="%.1f", padding=4, fontsize=9)
+        fig.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+    # These scores describe similarity between output and input, not correctness
+    # against a clean ground-truth image.
+    similarity_psnr, similarity_ssim = reference_metrics(output_rgb, input_rgb)
+    st.markdown("### Input–output similarity")
     c1, c2, c3 = st.columns(3)
-    with c1:
-        st.caption("Sharpness (Laplacian variance)")
-        st.bar_chart(metric_df[["Sharpness (Laplacian variance)"]])
-    with c2:
-        st.caption("Contrast (grayscale standard deviation)")
-        st.bar_chart(metric_df[["Contrast (gray std.)"]])
-    with c3:
-        st.caption("Mean brightness (0–1)")
-        st.bar_chart(metric_df[["Mean brightness"]])
-
-    if reference is not None:
-        left, right = st.columns(2)
-        with left:
-            st.caption("PSNR against supplied reference (higher is generally better)")
-            st.bar_chart(pd.DataFrame(psnr_rows).set_index("Stage"))
-        with right:
-            st.caption("SSIM against supplied reference (closer to 1 is generally more similar)")
-            st.bar_chart(pd.DataFrame(ssim_rows).set_index("Stage"))
-    else:
-        st.info(
-            "PSNR and SSIM need a matching clean/reference image. Upload one in the sidebar to calculate "
-            "those metrics. The graphs above are image statistics, not proof that visual quality improved."
-        )
-
+    c1.metric("PSNR (output vs input)", f"{similarity_psnr:.2f} dB")
+    c2.metric("SSIM (output vs input)", f"{similarity_ssim:.3f}")
+    c3.metric("Brightness change", f"{after_brightness - before_brightness:+.3f}")
+    st.caption(
+        "PSNR and SSIM here compare the enhanced result with the original input only. "
+        "They measure how much the image changed, not whether the restored image is objectively correct. "
+        "Ground-truth restoration-quality evaluation requires a matching clean reference image."
+    )
 
 st.title("🌙 Nighttime Visibility Analysis")
 st.caption("Night Time Defogging Vision Network with Smart Glare Suppression")
@@ -218,14 +262,6 @@ with st.sidebar:
         st.caption("The fallback is not your trained CNN + Transformer model.")
     strength = st.slider("Post-processing strength", 0.0, 1.0, 0.45, 0.05)
     show_intermediate = st.checkbox("Show all processing stages", value=True)
-    st.markdown("---")
-    st.markdown("**Optional reference image**")
-    reference_file = st.file_uploader(
-        "Clean/reference image for PSNR and SSIM",
-        type=["jpg", "jpeg", "png"],
-        key="reference_image",
-        help="Use the clean target image corresponding to the uploaded input. Metrics are not meaningful with an unrelated image.",
-    )
 
 uploads = st.file_uploader(
     "Upload nighttime / foggy / rainy / snowy road images",
@@ -233,10 +269,6 @@ uploads = st.file_uploader(
     accept_multiple_files=True,
     key="road_images",
 )
-
-reference = None
-if reference_file is not None:
-    reference = np.array(Image.open(reference_file).convert("RGB"))
 
 if not uploads:
     st.info("Upload one or more images to generate the full analysis screen. You can test the dashboard without training; the OpenCV fallback will be used if the V2 checkpoint is missing.")
@@ -331,7 +363,7 @@ else:
             sharp_b.metric("Enhancement-stage sharpness", f"{model_sharp:.2f}")
             delta.metric("Mean pixel change", f"{mean_change:.4f}")
 
-            show_metric_graphs(stages, reference=reference)
+            show_metric_graphs(original_rgb, to_uint8(final))
 
             st.download_button(
                 "Download final enhanced image",
