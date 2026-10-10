@@ -1,122 +1,95 @@
-# NightVision-Dehaze v2
+# NightVision-Dehaze v3 (hybrid training prototype)
 
 **Nighttime and adverse-weather road-image restoration with CNN, channel attention and Transformer features**
 
-A laptop-friendly research prototype for enhancing nighttime, foggy, rainy and snowy road images. V2 keeps the input resolution intact during inference by processing overlapping 256x256 tiles instead of shrinking the entire image to 128x128.
+This project combines real paired ACDC adverse-condition examples with synthetic degraded-clean examples. The synthetic examples are generated on the fly from clean reference images and use the original clean image as the training target. Synthetic effects are approximations, not exact models of real-world weather or glare.
 
-## What changed in v2
+## What the hybrid pipeline does
 
-- ACDC **fog + night + rain + snow** paired training.
-- Random **256x256 patches** during training to preserve local road/object details.
-- Conservative residual restoration so the model learns a correction instead of freely replacing the input.
-- L1 + SSIM + Sobel edge loss to reduce blur and preserve edges.
-- Full-resolution tiled inference with overlap blending.
-- Quality guard that blends toward the original if the neural output becomes substantially softer or changes too aggressively.
-- Lightweight LAB contrast/sharpening as an optional final post-processing stage in the Streamlit app.
+- Uses real ACDC fog, night, rain and snow input/reference pairs.
+- Generates synthetic haze, low-light, rain, snow and glare inputs from clean reference images; each clean image is the target for its synthetic input.
+- Keeps real ACDC inputs from being artificially degraded a second time by default.
+- Uses L1 + SSIM + Sobel edge losses.
+- Reports aggregate validation metrics and separate metrics for each real/synthetic validation category.
+- Saves one validation montage per category (input | prediction | reference) when a new best checkpoint is found.
+- Uses a separate v3 checkpoint filename so the existing v2 checkpoint is not overwritten.
 
-## ACDC dataset
+## Dataset layout
 
-Keep the dataset outside this repository.
-
-Expected local dataset root:
+Keep the ACDC dataset outside the repository. The expected root is:
 
 ```text
 E:\rgb_anon_trainvaltest\rgb_anon
 ├── fog
-│   ├── train
-│   ├── train_ref
-│   ├── val
-│   ├── val_ref
-│   ├── test
-│   └── test_ref
+│   ├── train / train_ref
+│   ├── val / val_ref
+│   └── test / test_ref
 ├── night
-│   ├── train
-│   ├── train_ref
-│   ├── val
-│   ├── val_ref
-│   ├── test
-│   └── test_ref
+│   ├── train / train_ref
+│   ├── val / val_ref
+│   └── test / test_ref
 ├── rain
-│   ├── train
-│   ├── train_ref
-│   ├── val
-│   ├── val_ref
-│   ├── test
-│   └── test_ref
+│   ├── train / train_ref
+│   ├── val / val_ref
+│   └── test / test_ref
 └── snow
-    ├── train
-    ├── train_ref
-    ├── val
-    ├── val_ref
-    ├── test
-    └── test_ref
+    ├── train / train_ref
+    ├── val / val_ref
+    └── test / test_ref
 ```
 
-The loader matches `*_rgb_anon.png` inputs with the corresponding `*_rgb_ref_anon.png` normal-condition images.
+The paired loader matches `*_rgb_anon.png` input names with their corresponding `*_rgb_ref_anon.png` reference names. Synthetic training uses only `fog/train_ref` as its clean-image pool; synthetic validation uses only `fog/val_ref`. The test split is not used by the training script.
 
-## Install
+## Windows setup
+
+Run these commands from the repository directory. If the virtual environment is in the parent project directory, activate it with the path below (adjust only if your folder differs):
 
 ```powershell
-.venv\Scripts\activate
-pip install -r requirements.txt
+& "..\.venv\Scripts\Activate.ps1"
+python -m pip install -r requirements.txt
+python -c "import torch; print(torch.__version__, torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 ```
 
-## Train v2 locally
+## Step 1 — small GPU smoke test
 
-Start with 100 pairs to verify the pipeline:
+Start small on GPUs with limited VRAM. This trains on 40 real pairs plus 40 synthetic examples per epoch and evaluates on the validation split. It may still take time; watch GPU memory and temperature.
 
 ```powershell
-python train_acdc.py --data "E:\rgb_anon_trainvaltest\rgb_anon" --epochs 2 --limit 100 --batch 2 --size 256
+python train_acdc.py --data "E:\rgb_anon_trainvaltest\rgb_anon" --epochs 1 --limit 40 --batch 1 --size 128 --out "checkpoints\acdc_v3_smoke_best.pth" --validation-images "outputs\smoke_validation"
 ```
 
-Then train the 500-pair prototype:
+Check that it prints `Device: cuda`, finishes an epoch, saves a checkpoint and writes validation montages. If CUDA runs out of memory, retry with `--size 96` is not supported (size must be divisible by 8, so 96 is supported); or use `--size 96` and `--batch 1`.
+
+## Step 2 — small experiment
+
+Only after the smoke test succeeds:
 
 ```powershell
-python train_acdc.py --data "E:\rgb_anon_trainvaltest\rgb_anon" --epochs 5 --limit 500 --batch 2 --size 256
+python train_acdc.py --data "E:\rgb_anon_trainvaltest\rgb_anon" --epochs 3 --limit 200 --batch 1 --size 128 --out "checkpoints\acdc_v3_hybrid_best.pth"
 ```
 
-For the final prototype, you can remove `--limit 500` to use all available ACDC training pairs:
+## Step 3 — full hybrid training
+
+The complete run uses all available real training pairs plus an equal number of synthetic examples per epoch. On a 2 GB GPU, use 128px patches and batch size 1 first; larger settings may exceed VRAM or take a long time.
 
 ```powershell
-python train_acdc.py --data "E:\rgb_anon_trainvaltest\rgb_anon" --epochs 5 --batch 2 --size 256
+python train_acdc.py --data "E:\rgb_anon_trainvaltest\rgb_anon" --epochs 5 --limit 0 --batch 1 --size 128 --out "checkpoints\acdc_v3_hybrid_best.pth"
 ```
 
-V2 saves the best checkpoint to:
-
-```text
-checkpoints/acdc_v2_best.pth
-```
-
-The script reports training/validation loss, PSNR and SSIM after every epoch.
+The script reports real and synthetic validation categories separately and saves the best checkpoint to the path supplied with `--out`. Validation montages are written under `outputs\hybrid_validation`. Each montage is ordered **input | model prediction | clean/reference target**.
 
 ## Run the Streamlit demo
-
-After v2 training:
 
 ```powershell
 streamlit run app.py
 ```
 
-Upload a nighttime, foggy, rainy or snowy road image. The app shows:
+The app currently loads its configured checkpoint path; do not assume it is using the newly trained v3 checkpoint until that path is deliberately updated and the model is evaluated. Keep the v2 checkpoint until v3 has been compared against it.
 
-1. Original input.
-2. Full-resolution neural restoration with the quality guard.
-3. Final lightweight enhanced output.
+## Important evaluation notes
 
-It also displays sharpness and mean-change diagnostics.
-
-## Command-line inference
-
-```powershell
-python inference.py --input "path\to\image.png" --output "outputs\enhanced_v2.png"
-```
-
-The command uses 256x256 overlapping tiles by default and writes quality diagnostics to the terminal.
-
-## Dataset policy
-
-Third-party datasets are intentionally not committed to GitHub. Keep ACDC on the local machine and follow its license/terms. Only source code, documentation, and small project assets belong in this repository.
-
-## Research note
-
-This is a proof-of-concept implementation, not a claim that it reproduces a published architecture exactly. Report real ACDC test metrics separately from synthetic augmentation results.
+- Synthetic degradation is a controllable approximation. Strong results on synthetic data do not prove real-world robustness.
+- Glare removal is inherently limited: saturated headlight regions may have lost information that a model cannot recover.
+- Do not train on the ACDC test split. Report its metrics only after training choices are complete.
+- This is a research/college prototype, not a guarantee of safety-critical road visibility.
+- Keep the dataset outside GitHub and follow the dataset's license/terms.
