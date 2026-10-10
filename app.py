@@ -241,6 +241,54 @@ def show_metric_graphs(stages):
         "To evaluate true dehazing quality, compare every stage against a corresponding clean ground-truth image."
     )
 
+    # Additional input-versus-final image property comparisons.
+    st.markdown("## 🎨 Input vs. Final Output — Image Property Comparisons")
+    input_rgb = to_uint8(stages["Input"])
+    final_rgb = to_uint8(stages["Final Output"])
+    input_gray = cv2.cvtColor(input_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    final_gray = cv2.cvtColor(final_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    input_hsv = cv2.cvtColor(input_rgb, cv2.COLOR_RGB2HSV)
+    final_hsv = cv2.cvtColor(final_rgb, cv2.COLOR_RGB2HSV)
+
+    comparisons = [
+        ("Brightness comparison", "Mean grayscale brightness (0–1)",
+         [float(input_gray.mean()), float(final_gray.mean())], ["#3498DB", "#2ECC71"], (0, 1)),
+        ("Contrast comparison", "Grayscale standard deviation (0–1)",
+         [float(input_gray.std()), float(final_gray.std())], ["#8E7CC3", "#F39C12"], None),
+        ("Sharpness comparison", "Laplacian variance",
+         [float(cv2.Laplacian(input_gray, cv2.CV_32F).var()),
+          float(cv2.Laplacian(final_gray, cv2.CV_32F).var())], ["#3498DB", "#2ECC71"], None),
+        ("Color saturation comparison", "Mean HSV saturation (0–255)",
+         [float(input_hsv[:, :, 1].mean()), float(final_hsv[:, :, 1].mean())], ["#E67E22", "#16A085"], (0, 255)),
+    ]
+
+    row1_left, row1_right = st.columns(2)
+    row2_left, row2_right = st.columns(2)
+    for idx, (chart_title, ylabel, values, colors, limits) in enumerate(comparisons):
+        fig, ax = plt.subplots(figsize=(6.4, 3.8))
+        bars = ax.bar(["Input", "Final Output"], values, color=colors, width=0.58,
+                      edgecolor="white", linewidth=0.8)
+        ax.set_title(chart_title, fontsize=14, fontweight="bold", color="#17365D", pad=12)
+        ax.set_ylabel(ylabel)
+        ax.grid(axis="y", linestyle="--", alpha=0.25)
+        ax.set_axisbelow(True)
+        if limits is not None:
+            ax.set_ylim(*limits)
+        else:
+            ax.set_ylim(0, max(values) * 1.2 if max(values) > 0 else 1)
+        ax.bar_label(bars, fmt="%.3f" if idx < 2 else ("%.2f" if idx == 2 else "%.1f"),
+                     padding=4, fontsize=9, fontweight="bold")
+        ax.set_facecolor("#FBFCFE")
+        fig.patch.set_facecolor("white")
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+        fig.tight_layout()
+        target = [row1_left, row1_right, row2_left, row2_right][idx]
+        with target:
+            st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+
 st.title("🌙 Nighttime Visibility Analysis")
 st.caption("Night Time Defogging Vision Network with Smart Glare Suppression")
 st.markdown(
