@@ -1,8 +1,5 @@
 import os
 import io
-import base64
-import hashlib
-
 import cv2
 import numpy as np
 import pandas as pd
@@ -22,43 +19,6 @@ st.set_page_config(
 )
 
 CHECKPOINT = "checkpoints/acdc_v2_best.pth"
-
-
-def get_openai_api_key():
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        return str(st.secrets.get("OPENAI_API_KEY", "")).strip()
-    except Exception:
-        return ""
-
-
-def enhance_with_image_api(image_bytes, filename, api_key):
-    """Temporary demo enhancement. Output may reconstruct details, so retain original for comparison."""
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key)
-    image_file = io.BytesIO(image_bytes)
-    image_file.name = filename if filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")) else "input.png"
-    result = client.images.edit(
-        model="gpt-image-1.5",
-        image=image_file,
-        prompt=(
-            "Edit this exact nighttime road photograph for improved visibility. Reduce atmospheric fog and haze, "
-            "improve local contrast, gently lift underexposed road details, and reduce excessive headlight bloom. "
-            "Preserve the original camera viewpoint, road layout, lane markings, vehicles, signs, buildings, trees, "
-            "and all scene geometry. Do not add, remove, duplicate, or relocate objects. Keep a natural realistic "
-            "nighttime photograph; do not turn it into an illustration or invent details hidden by the fog."
-        ),
-        quality="medium",
-        input_fidelity="high",
-        output_format="png",
-    )
-    image_b64 = result.data[0].b64_json
-    if not image_b64:
-        raise RuntimeError("The image service returned no image data.")
-    return np.array(Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB"))
 
 
 @st.cache_resource
@@ -161,6 +121,43 @@ def classic_enhancement(rgb, strength=0.45):
     alpha = float(np.clip(strength, 0, 1))
     out = cv2.addWeighted(rgb, 1.0 - alpha, sharp, alpha, 0)
     return to_float(out)
+
+
+def local_crystal_enhancement(rgb, strength=0.75):
+    """Free local OpenCV enhancement: luminance CLAHE, adaptive gamma, denoising and unsharp masking.
+
+    This improves perceived visibility but cannot recover scene details that are absent from the input.
+    """
+    src = np.asarray(rgb, dtype=np.uint8)
+    lab = cv2.cvtColor(src, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+
+    # Improve local contrast without aggressively changing color.
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0 + 0.8 * float(np.clip(strength, 0, 1)),
+        tileGridSize=(8, 8),
+    )
+    enhanced_l = clahe.apply(l)
+
+    # Adaptive gamma: brighten darker images while keeping highlights controlled.
+    mean_luma = float(np.mean(enhanced_l)) / 255.0
+    gamma = float(np.clip(1.0 - (0.48 - mean_luma) * 0.72, 0.62, 1.0))
+    lut = np.array([round(((i / 255.0) ** gamma) * 255) for i in range(256)], dtype=np.uint8)
+    enhanced_l = cv2.LUT(enhanced_l, lut)
+
+    contrast_rgb = cv2.cvtColor(cv2.merge((enhanced_l, a, b)), cv2.COLOR_LAB2RGB)
+
+    # Gentle color-preserving denoise before detail sharpening.
+    denoised = cv2.bilateralFilter(contrast_rgb, d=5, sigmaColor=22, sigmaSpace=22)
+    sigma = 1.15
+    soft = cv2.GaussianBlur(denoised, (0, 0), sigmaX=sigma)
+    amount = 0.65 + 0.55 * float(np.clip(strength, 0, 1))
+    sharpened = cv2.addWeighted(denoised, 1.0 + amount, soft, -amount, 0)
+
+    # Blend with the original to limit halos and unnatural texture.
+    alpha = 0.55 + 0.35 * float(np.clip(strength, 0, 1))
+    result = cv2.addWeighted(src, 1.0 - alpha, sharpened, alpha, 0)
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 def postprocess_image(rgb01, strength=0.45):
@@ -346,12 +343,10 @@ with st.sidebar:
     strength = st.slider("Post-processing strength", 0.0, 1.0, 0.45, 0.05)
     show_intermediate = st.checkbox("Show all processing stages", value=True)
     st.markdown("---")
-    st.subheader("Temporary enhancement layer")
-    use_api_preview = st.checkbox("Generate enhanced preview", value=True)
-    api_key = get_openai_api_key()
-    if use_api_preview and not api_key:
-        st.warning("Add OPENAI_API_KEY to your environment or Streamlit secrets to enable this layer.")
-    st.caption("This optional preview is separate from your trained model; your original pipeline remains below.")
+    st.subheader("Free local enhancement")
+    use_local_preview = st.checkbox("Show local clarity-enhanced preview", value=True)
+    local_strength = st.slider("Local enhancement strength", 0.0, 1.0, 0.75, 0.05, key="local_enhancement_strength")
+    st.caption("Runs on your computer with OpenCV. No API key or per-image API charge is needed.")
 
 uploads = st.file_uploader(
     "Upload nighttime / foggy / rainy / snowy road images",
@@ -381,37 +376,21 @@ else:
         condition = condition_analysis(original_rgb)
 
         with st.expander(f"Image {index + 1}: {uploaded.name}", expanded=(index == 0)):
-            if use_api_preview and api_key:
-                image_bytes = uploaded.getvalue()
-                cache_key = hashlib.sha256(image_bytes).hexdigest()
-                preview_cache = st.session_state.setdefault("temporary_api_previews", {})
-                if cache_key not in preview_cache:
-                    with st.spinner("Generating temporary enhanced preview..."):
-                        try:
-                            preview_cache[cache_key] = {
-                                "image": enhance_with_image_api(image_bytes, uploaded.name, api_key),
-                                "error": None,
-                            }
-                        except Exception as exc:
-                            preview_cache[cache_key] = {"image": None, "error": str(exc)}
-                api_result = preview_cache[cache_key]
-                st.markdown("### Temporary Enhanced Preview")
-                st.caption("API-assisted demo layer. The original project model and its results are preserved below.")
-                if api_result["image"] is not None:
-                    api_preview = api_result["image"]
-                    preview_left, preview_right = st.columns(2)
-                    preview_left.image(original_rgb, caption="Original input", width="stretch")
-                    preview_right.image(api_preview, caption="Enhanced preview", width="stretch")
-                    st.download_button(
-                        "Download enhanced preview",
-                        data=png_bytes(to_float(api_preview)),
-                        file_name=f"{os.path.splitext(uploaded.name)[0]}_temporary_preview.png",
-                        mime="image/png",
-                        key=f"api_preview_download_{index}_{cache_key[:10]}",
-                    )
-                else:
-                    st.error(f"Could not generate the temporary preview: {api_result['error']}")
-                    st.caption("Your existing project pipeline will still run below.")
+            if use_local_preview:
+                with st.spinner("Applying free local clarity enhancement..."):
+                    local_preview = local_crystal_enhancement(original_rgb, local_strength)
+                st.markdown("### Local Clarity-Enhanced Preview")
+                st.caption("OpenCV processing runs locally and preserves the original image dimensions. Compare carefully for halos or amplified noise in very dark areas.")
+                preview_left, preview_right = st.columns(2)
+                preview_left.image(original_rgb, caption="Original input", width="stretch")
+                preview_right.image(local_preview, caption="Local enhanced preview", width="stretch")
+                st.download_button(
+                    "Download local enhanced preview",
+                    data=cv2.imencode(".png", cv2.cvtColor(local_preview, cv2.COLOR_RGB2BGR))[1].tobytes(),
+                    file_name=f"{os.path.splitext(uploaded.name)[0]}_local_enhanced.png",
+                    mime="image/png",
+                    key=f"local_preview_download_{index}_{uploaded.name}",
+                )
             st.subheader("Nighttime Visibility Analysis")
             st.caption(f"Image size: {original_rgb.shape[1]} × {original_rgb.shape[0]} px")
 
