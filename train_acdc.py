@@ -226,9 +226,12 @@ def main():
     best = float("inf")
     for epoch in range(1, args.epochs + 1):
         start = time.time()
-        train_loss, train_psnr, train_ssim, _ = run_epoch(
+        train_metrics, _ = run_epoch(
             model, train_loader, optimizer, scaler, device, train=True
         )
+        train_loss = train_metrics["loss"]
+        train_psnr = train_metrics["psnr"]
+        train_ssim = train_metrics["ssim"]
         # Validate real ACDC pairs separately from synthetic pairs. This avoids
         # selecting a checkpoint just because one validation domain is easier.
         val_results = {}
@@ -296,7 +299,7 @@ def main():
                 for label, ds in zip(val_labels, val_parts):
                     loader = DataLoader(ds, batch_size=args.batch, shuffle=False,
                                         num_workers=args.workers, pin_memory=device.type == "cuda")
-                    _, _, _, _ = run_epoch(
+                    run_epoch(
                         model, loader, optimizer, scaler, device, train=False,
                         save_dir=os.path.join(args.validation_images, f"epoch_{epoch:03d}", label)
                     )
