@@ -174,14 +174,18 @@ def main():
     synthetic_train_len = int(round(len(real_train) * args.synthetic_ratio))
     synthetic_val_len = max(len(real_val) // 1, 1) if args.synthetic_ratio > 0 else 0
     train_parts = [real_train]
+    train_labels = ["real"]
     val_parts = [real_val]
+    val_labels = ["real"]
     if synthetic_train_len:
         train_parts.append(SyntheticDegradationDataset(
             args.data, "train", args.size, length=synthetic_train_len
         ))
+        train_labels.append("synthetic")
         val_parts.append(SyntheticDegradationDataset(
             args.data, "val", args.size, length=synthetic_val_len
         ))
+        val_labels.append("synthetic")
 
     train_ds = ConcatDataset(train_parts) if len(train_parts) > 1 else train_parts[0]
     val_ds = ConcatDataset(val_parts) if len(val_parts) > 1 else val_parts[0]
@@ -209,23 +213,44 @@ def main():
         train_loss, train_psnr, train_ssim, _ = run_epoch(
             model, train_loader, optimizer, scaler, device, train=True
         )
+        # Validate real ACDC pairs separately from synthetic pairs. This avoids
+        # selecting a checkpoint just because one validation domain is easier.
+        val_results = {}
         with torch.no_grad():
-            val_loss, val_psnr, val_ssim, by_condition = run_epoch(
-                model, val_loader, optimizer, scaler, device, train=False
-            )
+            for label, ds in zip(val_labels, val_parts):
+                loader = DataLoader(ds, batch_size=args.batch, shuffle=False,
+                                    num_workers=args.workers, pin_memory=device.type == "cuda")
+                result = run_epoch(model, loader, optimizer, scaler, device, train=False)
+                val_results[label] = result
+        real_loss, real_psnr, real_ssim, real_by_condition = val_results["real"]
+        if "synthetic" in val_results:
+            syn_loss, syn_psnr, syn_ssim, syn_by_condition = val_results["synthetic"]
+        else:
+            syn_loss = syn_psnr = syn_ssim = None
+            syn_by_condition = {}
+        # Use real validation loss to select the checkpoint; synthetic metrics
+        # remain diagnostic and do not dominate model selection.
+        selection_loss = real_loss
         elapsed = time.time() - start
         print(
             f"Epoch {epoch}/{args.epochs} | {elapsed:.1f}s | "
             f"train loss {train_loss:.4f} PSNR {train_psnr:.2f} SSIM {train_ssim:.4f} | "
-            f"val loss {val_loss:.4f} PSNR {val_psnr:.2f} SSIM {val_ssim:.4f}"
+            f"REAL val loss {real_loss:.4f} PSNR {real_psnr:.2f} SSIM {real_ssim:.4f}"
         )
-        print("  Validation by condition:")
-        for name, metrics in sorted(by_condition.items()):
+        if syn_loss is not None:
+            print(f"  SYNTHETIC val loss {syn_loss:.4f} PSNR {syn_psnr:.2f} SSIM {syn_ssim:.4f}")
+        print("  Real validation by condition:")
+        for name, metrics in sorted(real_by_condition.items()):
             print(f"    {name:18s} L1 {metrics['loss']:.4f} "
                   f"PSNR {metrics['psnr']:.2f} SSIM {metrics['ssim']:.4f}")
+        if syn_by_condition:
+            print("  Synthetic validation by condition:")
+            for name, metrics in sorted(syn_by_condition.items()):
+                print(f"    {name:18s} L1 {metrics['loss']:.4f} "
+                      f"PSNR {metrics['psnr']:.2f} SSIM {metrics['ssim']:.4f}")
 
-        if val_loss < best:
-            best = val_loss
+        if selection_loss < best:
+            best = selection_loss
             torch.save({
                 "model": model.state_dict(),
                 "base": 24,
@@ -233,18 +258,25 @@ def main():
                 "dataset": "ACDC real pairs + synthetic clean-target haze/night/rain/snow/glare",
                 "version": "v3-hybrid-synthetic",
                 "epoch": epoch,
-                "val_loss": val_loss,
-                "val_psnr": val_psnr,
-                "val_ssim": val_ssim,
-                "validation_by_condition": by_condition,
+                "val_loss": real_loss,
+                "val_psnr": real_psnr,
+                "val_ssim": real_ssim,
+                "real_validation_by_condition": real_by_condition,
+                "synthetic_validation": {
+                    "loss": syn_loss, "psnr": syn_psnr, "ssim": syn_ssim,
+                    "by_condition": syn_by_condition,
+                },
             }, args.out)
-            print(f"  saved best checkpoint -> {args.out}")
-            # Separate validation image for each category: input | prediction | reference.
+            print(f"  saved best checkpoint (selected on REAL validation) -> {args.out}")
+            # Save real and synthetic visual comparisons separately.
             with torch.no_grad():
-                _, _, _, _ = run_epoch(
-                    model, val_loader, optimizer, scaler, device, train=False,
-                    save_dir=os.path.join(args.validation_images, f"epoch_{epoch:03d}")
-                )
+                for label, ds in zip(val_labels, val_parts):
+                    loader = DataLoader(ds, batch_size=args.batch, shuffle=False,
+                                        num_workers=args.workers, pin_memory=device.type == "cuda")
+                    _, _, _, _ = run_epoch(
+                        model, loader, optimizer, scaler, device, train=False,
+                        save_dir=os.path.join(args.validation_images, f"epoch_{epoch:03d}", label)
+                    )
 
     print("Training complete.")
     print("Keep the existing app checkpoint until this model has been evaluated.")
