@@ -2,12 +2,15 @@ import argparse
 import os
 import random
 import time
+from collections import defaultdict
 
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 
-from acdc_dataset import ACDCPairedDataset
+from acdc_dataset import ACDCPairedDataset, SyntheticDegradationDataset
 from model import NightDehazeNet
 
 
@@ -32,12 +35,12 @@ def edge_loss(x, y):
     """Sobel-gradient loss to discourage blurry road/vehicle edges."""
     gray_x = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
     gray_y = 0.299 * y[:, 0:1] + 0.587 * y[:, 1:2] + 0.114 * y[:, 2:3]
-    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
-    ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
-    gx = F.conv2d(gray_x, kx, padding=1)
-    gy = F.conv2d(gray_x, ky, padding=1)
-    gx_t = F.conv2d(gray_y, kx, padding=1)
-    gy_t = F.conv2d(gray_y, ky, padding=1)
+    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                      device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
+    ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                      device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
+    gx, gy = F.conv2d(gray_x, kx, padding=1), F.conv2d(gray_x, ky, padding=1)
+    gx_t, gy_t = F.conv2d(gray_y, kx, padding=1), F.conv2d(gray_y, ky, padding=1)
     return F.l1_loss(gx, gx_t) + F.l1_loss(gy, gy_t)
 
 
@@ -48,20 +51,31 @@ def psnr(x, y):
     return 10.0 * torch.log10(torch.tensor(1.0 / mse, device=x.device)).item()
 
 
-def run_epoch(model, loader, optimizer, scaler, device, train=True):
+def condition_names(value, batch_size):
+    if isinstance(value, (tuple, list)):
+        return list(value)
+    return [str(value)] * batch_size
+
+
+def run_epoch(model, loader, optimizer, scaler, device, train=True, save_dir=None):
     model.train(train)
     total_loss = total_psnr = total_ssim = n = 0
-    for x, y, _, _ in loader:
+    by_condition = defaultdict(lambda: {"loss": 0.0, "psnr": 0.0, "ssim": 0.0, "n": 0})
+    saved = set()
+
+    for x, y, condition, paths in loader:
         x = x.to(device=device, dtype=torch.float32, non_blocking=True)
         y = y.to(device=device, dtype=torch.float32, non_blocking=True)
         if train:
             optimizer.zero_grad(set_to_none=True)
+
         with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-            out = model(x)
+            out = model(x).clamp(0, 1)
             l1 = F.l1_loss(out, y)
             sl = ssim_loss(out, y)
             el = edge_loss(out, y)
             loss = l1 + 0.20 * sl + 0.05 * el
+
         if train:
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -70,45 +84,99 @@ def run_epoch(model, loader, optimizer, scaler, device, train=True):
             else:
                 loss.backward()
                 optimizer.step()
+
         bs = x.size(0)
+        batch_psnr = psnr(out.detach(), y)
+        batch_ssim = 1.0 - sl.item()
         total_loss += loss.item() * bs
-        total_psnr += psnr(out.detach(), y) * bs
-        total_ssim += (1.0 - sl.item()) * bs
+        total_psnr += batch_psnr * bs
+        total_ssim += batch_ssim * bs
         n += bs
-    return total_loss / n, total_psnr / n, total_ssim / n
+
+        names = condition_names(condition, bs)
+        per_sample_loss = F.l1_loss(out.detach(), y, reduction="none").mean(dim=(1, 2, 3))
+        for i, name in enumerate(names):
+            stats = by_condition[name]
+            stats["loss"] += float(per_sample_loss[i].item())
+            stats["psnr"] += batch_psnr
+            stats["ssim"] += batch_ssim
+            stats["n"] += 1
+
+            if save_dir and name not in saved:
+                os.makedirs(save_dir, exist_ok=True)
+                def to_bgr(t):
+                    arr = t[i].detach().float().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
+                    return cv2.cvtColor((arr * 255.0).round().astype(np.uint8), cv2.COLOR_RGB2BGR)
+                # One compact side-by-side example per validation category.
+                montage = np.concatenate([to_bgr(x), to_bgr(out), to_bgr(y)], axis=1)
+                safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(name))
+                cv2.imwrite(os.path.join(save_dir, safe_name + ".jpg"), montage)
+                saved.add(name)
+
+    if n == 0:
+        raise RuntimeError("DataLoader produced no batches.")
+    summary = {k: {metric: value / stats["n"] for metric, value in stats.items()
+                   if metric != "n"} for k, stats in by_condition.items()}
+    return total_loss / n, total_psnr / n, total_ssim / n, summary
 
 
 def main():
-    p = argparse.ArgumentParser(description="Train NightVision-Dehaze v2 on paired ACDC conditions")
+    p = argparse.ArgumentParser(
+        description="Train NightVision-Dehaze with real ACDC pairs plus synthetic clean-target degradations"
+    )
     p.add_argument("--data", default=r"E:\rgb_anon_trainvaltest\rgb_anon")
     p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch", type=int, default=2)
-    p.add_argument("--size", type=int, default=256)
+    p.add_argument("--batch", type=int, default=1)
+    p.add_argument("--size", type=int, default=128)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--workers", type=int, default=0)
-    p.add_argument("--limit", type=int, default=0, help="0 = use all training pairs")
-    p.add_argument("--out", default="checkpoints/acdc_v2_best.pth")
+    p.add_argument("--limit", type=int, default=0, help="0 = use all real training pairs")
+    p.add_argument("--synthetic-ratio", type=float, default=1.0,
+                   help="synthetic examples per real example; 1.0 gives a 50/50 mix")
+    p.add_argument("--out", default="checkpoints/acdc_v3_hybrid_best.pth")
+    p.add_argument("--validation-images", default="outputs/hybrid_validation")
     args = p.parse_args()
 
     if args.size % 8 != 0:
         raise ValueError("--size must be divisible by 8")
+    if args.synthetic_ratio < 0:
+        raise ValueError("--synthetic-ratio cannot be negative")
 
     random.seed(42)
+    np.random.seed(42)
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
+        torch.backends.cudnn.benchmark = True
 
-    train_ds = ACDCPairedDataset(args.data, "train", CONDITIONS, args.size, True, True)
-    val_ds = ACDCPairedDataset(args.data, "val", CONDITIONS, args.size, False, False)
-    if args.limit and args.limit < len(train_ds):
-        train_ds = Subset(train_ds, list(range(args.limit)))
+    real_train = ACDCPairedDataset(args.data, "train", CONDITIONS, args.size, True, False)
+    real_val = ACDCPairedDataset(args.data, "val", CONDITIONS, args.size, False, False)
+    if args.limit and args.limit < len(real_train):
+        real_train = Subset(real_train, list(range(args.limit)))
 
-    print(f"Conditions: {', '.join(CONDITIONS)}")
-    print(f"Training pairs: {len(train_ds)}")
-    print(f"Validation pairs: {len(val_ds)}")
-    print(f"Patch size: {args.size}x{args.size}")
+    synthetic_train_len = int(round(len(real_train) * args.synthetic_ratio))
+    synthetic_val_len = max(len(real_val) // 1, 1) if args.synthetic_ratio > 0 else 0
+    train_parts = [real_train]
+    val_parts = [real_val]
+    if synthetic_train_len:
+        train_parts.append(SyntheticDegradationDataset(
+            args.data, "train", args.size, length=synthetic_train_len
+        ))
+        val_parts.append(SyntheticDegradationDataset(
+            args.data, "val", args.size, length=synthetic_val_len
+        ))
+
+    train_ds = ConcatDataset(train_parts) if len(train_parts) > 1 else train_parts[0]
+    val_ds = ConcatDataset(val_parts) if len(val_parts) > 1 else val_parts[0]
+    print(f"Real ACDC training pairs: {len(real_train)}")
+    print(f"Synthetic training pairs: {synthetic_train_len}")
+    print(f"Total training examples/epoch: {len(train_ds)}")
+    print(f"Real ACDC validation pairs: {len(real_val)}")
+    print(f"Synthetic validation examples: {synthetic_val_len}")
+    print(f"Total validation examples: {len(val_ds)}")
+    print(f"Patch size: {args.size}x{args.size}; batch size: {args.batch}")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
                               num_workers=args.workers, pin_memory=device.type == "cuda")
@@ -123,31 +191,48 @@ def main():
     best = float("inf")
     for epoch in range(1, args.epochs + 1):
         start = time.time()
-        train_loss, train_psnr, train_ssim = run_epoch(model, train_loader, optimizer, scaler, device, True)
+        train_loss, train_psnr, train_ssim, _ = run_epoch(
+            model, train_loader, optimizer, scaler, device, train=True
+        )
         with torch.no_grad():
-            val_loss, val_psnr, val_ssim = run_epoch(model, val_loader, optimizer, scaler, device, False)
+            val_loss, val_psnr, val_ssim, by_condition = run_epoch(
+                model, val_loader, optimizer, scaler, device, train=False
+            )
         elapsed = time.time() - start
         print(
             f"Epoch {epoch}/{args.epochs} | {elapsed:.1f}s | "
             f"train loss {train_loss:.4f} PSNR {train_psnr:.2f} SSIM {train_ssim:.4f} | "
             f"val loss {val_loss:.4f} PSNR {val_psnr:.2f} SSIM {val_ssim:.4f}"
         )
+        print("  Validation by condition:")
+        for name, metrics in sorted(by_condition.items()):
+            print(f"    {name:18s} L1 {metrics['loss']:.4f} "
+                  f"PSNR {metrics['psnr']:.2f} SSIM {metrics['ssim']:.4f}")
+
         if val_loss < best:
             best = val_loss
             torch.save({
                 "model": model.state_dict(),
                 "base": 24,
                 "size": args.size,
-                "dataset": "ACDC fog + night + rain + snow paired restoration",
-                "version": "v2-patch-edge-loss",
+                "dataset": "ACDC real pairs + synthetic clean-target haze/night/rain/snow/glare",
+                "version": "v3-hybrid-synthetic",
                 "epoch": epoch,
                 "val_loss": val_loss,
                 "val_psnr": val_psnr,
                 "val_ssim": val_ssim,
+                "validation_by_condition": by_condition,
             }, args.out)
             print(f"  saved best checkpoint -> {args.out}")
+            # Separate validation image for each category: input | prediction | reference.
+            with torch.no_grad():
+                _, _, _, _ = run_epoch(
+                    model, val_loader, optimizer, scaler, device, train=False,
+                    save_dir=os.path.join(args.validation_images, f"epoch_{epoch:03d}")
+                )
 
     print("Training complete.")
+    print("Keep the existing app checkpoint until this model has been evaluated.")
 
 
 if __name__ == "__main__":
