@@ -117,7 +117,7 @@ def main():
 
     model = NightDehazeNet(base=24).to(device).float()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-        scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     best = float("inf")
