@@ -158,10 +158,10 @@ def main():
     p.add_argument("--data", default=r"E:\rgb_anon_trainvaltest\rgb_anon")
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch", type=int, default=1)
-    p.add_argument("--size", type=int, default=128)
+    p.add_argument("--size", type=int, default=256)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--workers", type=int, default=0)
-    p.add_argument("--limit", type=int, default=0, help="0 = use all real training pairs")
+    p.add_argument("--limit", type=int, default=500, help="Number of real training pairs to use (default: 500; 0 = use all)")
     p.add_argument("--synthetic-ratio", type=float, default=1.0,
                    help="synthetic examples per real example; 1.0 gives a 50/50 mix")
     p.add_argument("--out", default="checkpoints/acdc_v3_hybrid_best.pth")
