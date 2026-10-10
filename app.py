@@ -139,7 +139,7 @@ def postprocess_image(rgb01, strength=0.45):
 def image_metrics(rgb01):
     gray = cv2.cvtColor(to_uint8(rgb01), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
     return {
-        "Sharpness (Laplacian variance)": float(cv2.Laplacian(gray, cv2.CV_64F).var()),
+        "Sharpness (Laplacian variance)": float(cv2.Laplacian(gray, cv2.CV_32F).var()),
         "Contrast (gray std.)": float(np.std(gray)),
         "Mean brightness": float(np.mean(gray)),
     }
