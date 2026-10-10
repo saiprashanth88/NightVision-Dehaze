@@ -56,7 +56,7 @@ def run_epoch(model, loader, optimizer, scaler, device, train=True):
         y = y.to(device=device, dtype=torch.float32, non_blocking=True)
         if train:
             optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
             out = model(x)
             l1 = F.l1_loss(out, y)
             sl = ssim_loss(out, y)
@@ -117,7 +117,7 @@ def main():
 
     model = NightDehazeNet(base=24).to(device).float()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+        scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     best = float("inf")
