@@ -5,3 +5,4 @@ streamlit>=1.30
 Pillow>=10.0
 scikit-image>=0.21
 pandas>=2.0
+matplotlib>=3.7
