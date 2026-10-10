@@ -147,45 +147,63 @@ class SyntheticDegradationDataset(Dataset):
         x = clean.copy()
         h, w = x.shape[:2]
         if kind == "synthetic_haze":
-            # Atmospheric-scattering approximation with a smooth transmission map.
-            small = rng.uniform(0.35, 0.70, size=(max(2, h // 32), max(2, w // 32))).astype(np.float32)
+            # Smooth spatial transmission plus veiling light and reduced contrast.
+            coarse_h, coarse_w = max(2, h // 24), max(2, w // 24)
+            small = rng.uniform(0.22, 0.62, size=(coarse_h, coarse_w)).astype(np.float32)
             transmission = cv2.resize(small, (w, h), interpolation=cv2.INTER_CUBIC)
-            transmission = cv2.GaussianBlur(transmission, (0, 0), max(2, min(h, w) * 0.08))
-            transmission = np.clip(transmission, 0.35, 0.78)[..., None]
-            airlight = np.array([0.78, 0.82, 0.85], dtype=np.float32)
+            transmission = cv2.GaussianBlur(transmission, (0, 0), max(2, min(h, w) * 0.06))
+            transmission = np.clip(transmission, 0.22, 0.68)[..., None]
+            airlight = np.array([0.76, 0.80, 0.84], dtype=np.float32)
             x = x * transmission + airlight * (1.0 - transmission)
+            x = np.clip(x + rng.normal(0, 0.004, x.shape).astype(np.float32), 0, 1)
         elif kind == "synthetic_night":
-            gamma = float(rng.uniform(1.5, 2.3))
+            gamma = float(rng.uniform(1.8, 2.8))
             x = np.power(np.clip(x, 0, 1), gamma)
-            x *= rng.uniform(0.45, 0.75)
-            x[..., 2] *= rng.uniform(0.85, 1.0)  # RGB blue channel
-            x = np.clip(x + rng.normal(0, 0.008, x.shape).astype(np.float32), 0, 1)
+            x *= rng.uniform(0.28, 0.62)
+            # Low-light color cast, sensor noise and a small amount of chroma variation.
+            x[..., 0] *= rng.uniform(0.82, 1.0)
+            x[..., 2] *= rng.uniform(0.78, 0.98)
+            x = np.clip(x + rng.normal(0, 0.012, x.shape).astype(np.float32), 0, 1)
         elif kind == "synthetic_rain":
-            x *= float(rng.uniform(0.72, 0.92))
+            # Streaks at a slant, a slight contrast veil, and sensor noise.
+            x *= float(rng.uniform(0.62, 0.86))
             overlay = np.zeros((h, w), dtype=np.float32)
-            count = max(20, (h * w) // 180)
+            count = max(35, (h * w) // 100)
             for _ in range(count):
                 px, py = int(rng.integers(0, w)), int(rng.integers(0, h))
-                length = int(rng.integers(5, max(6, min(18, h // 3))))
-                cv2.line(overlay, (px, py), (min(w - 1, px + 2), min(h - 1, py + length)),
-                         float(rng.uniform(0.25, 0.65)), 1, cv2.LINE_AA)
-            x = np.clip(x + overlay[..., None] * 0.45, 0, 1)
+                length = int(rng.integers(5, max(6, min(22, h // 2))))
+                dx = int(rng.integers(-3, 4))
+                cv2.line(overlay, (px, py),
+                         (min(w - 1, max(0, px + dx)), min(h - 1, py + length)),
+                         float(rng.uniform(0.30, 0.85)), 1, cv2.LINE_AA)
+            x = np.clip(x * 0.92 + 0.08 + overlay[..., None] * 0.55, 0, 1)
         elif kind == "synthetic_snow":
+            # Combine smaller flakes, a few larger out-of-focus flakes, and a light veil.
             overlay = np.zeros((h, w), dtype=np.float32)
-            for _ in range(max(25, (h * w) // 130)):
+            count = max(18, (h * w) // 220)
+            for _ in range(count):
                 px, py = int(rng.integers(0, w)), int(rng.integers(0, h))
-                cv2.circle(overlay, (px, py), int(rng.integers(1, 3)), 1.0, -1, cv2.LINE_AA)
-            x = np.clip(x * 0.82 + overlay[..., None] * 0.65, 0, 1)
-            x = x * 0.88 + np.array([0.12, 0.13, 0.15], dtype=np.float32)
+                radius = int(rng.choice([1, 1, 1, 2, 3]))
+                cv2.circle(overlay, (px, py), radius, float(rng.uniform(0.65, 1.0)), -1, cv2.LINE_AA)
+            overlay = cv2.GaussianBlur(overlay, (3, 3), 0.45)
+            x = np.clip(x * 0.80 + overlay[..., None] * 0.62, 0, 1)
+            x = np.clip(x * 0.90 + np.array([0.10, 0.11, 0.13], dtype=np.float32), 0, 1)
         elif kind == "synthetic_glare":
+            # Broad veiling bloom + saturated cores; deliberately stronger than v3,
+            # but still a synthetic approximation and not a substitute for real glare data.
             yy, xx = np.mgrid[0:h, 0:w]
+            x *= float(rng.uniform(0.78, 0.94))
             for _ in range(int(rng.integers(1, 3))):
                 cx, cy = int(rng.integers(0, w)), int(rng.integers(0, h))
-                sigma = float(rng.uniform(max(4, min(h, w) * 0.025), max(6, min(h, w) * 0.08)))
-                glow = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma * sigma))
-                core = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * (sigma * 0.22) ** 2))
-                x = np.clip(x + glow[..., None] * rng.uniform(0.15, 0.35)
-                            + core[..., None] * 0.55, 0, 1)
+                sigma = float(rng.uniform(max(7, min(h, w) * 0.045), max(10, min(h, w) * 0.13)))
+                distance2 = (xx - cx) ** 2 + (yy - cy) ** 2
+                glow = np.exp(-distance2 / (2 * sigma * sigma))
+                core = np.exp(-distance2 / (2 * (sigma * 0.18) ** 2))
+                veil = np.clip(glow * rng.uniform(0.28, 0.55), 0, 1)
+                x = x * (1.0 - veil[..., None] * 0.45) + veil[..., None] * np.array(
+                    [0.95, 0.92, 0.86], dtype=np.float32
+                )
+                x = np.clip(x + core[..., None] * 0.9, 0, 1)
         return np.ascontiguousarray(np.clip(x, 0, 1), dtype=np.float32)
 
     def __getitem__(self, index):
