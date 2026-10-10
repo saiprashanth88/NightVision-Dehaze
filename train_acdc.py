@@ -74,8 +74,11 @@ def condition_names(value, batch_size):
 
 def run_epoch(model, loader, optimizer, scaler, device, train=True, save_dir=None):
     model.train(train)
-    total_loss = total_psnr = total_ssim = n = 0
-    by_condition = defaultdict(lambda: {"loss": 0.0, "psnr": 0.0, "ssim": 0.0, "n": 0})
+    total_loss = total_psnr = total_ssim = total_input_psnr = total_input_ssim = n = 0
+    by_condition = defaultdict(lambda: {
+        "loss": 0.0, "psnr": 0.0, "ssim": 0.0,
+        "input_psnr": 0.0, "input_ssim": 0.0, "n": 0
+    })
     saved = set()
 
     for x, y, condition, paths in loader:
@@ -103,9 +106,13 @@ def run_epoch(model, loader, optimizer, scaler, device, train=True, save_dir=Non
         bs = x.size(0)
         per_psnr = psnr_per_image(out.detach(), y)
         per_ssim = ssim_per_image(out.detach(), y)
+        input_psnr = psnr_per_image(x, y)
+        input_ssim = ssim_per_image(x, y)
         total_loss += loss.item() * bs
         total_psnr += float(per_psnr.sum().item())
         total_ssim += float(per_ssim.sum().item())
+        total_input_psnr += float(input_psnr.sum().item())
+        total_input_ssim += float(input_ssim.sum().item())
         n += bs
 
         names = condition_names(condition, bs)
@@ -115,6 +122,8 @@ def run_epoch(model, loader, optimizer, scaler, device, train=True, save_dir=Non
             stats["loss"] += float(per_sample_loss[i].item())
             stats["psnr"] += float(per_psnr[i].item())
             stats["ssim"] += float(per_ssim[i].item())
+            stats["input_psnr"] += float(input_psnr[i].item())
+            stats["input_ssim"] += float(input_ssim[i].item())
             stats["n"] += 1
 
             if save_dir and name not in saved:
@@ -132,7 +141,14 @@ def run_epoch(model, loader, optimizer, scaler, device, train=True, save_dir=Non
         raise RuntimeError("DataLoader produced no batches.")
     summary = {k: {metric: value / stats["n"] for metric, value in stats.items()
                    if metric != "n"} for k, stats in by_condition.items()}
-    return total_loss / n, total_psnr / n, total_ssim / n, summary
+    overall = {
+        "loss": total_loss / n,
+        "psnr": total_psnr / n,
+        "ssim": total_ssim / n,
+        "input_psnr": total_input_psnr / n,
+        "input_ssim": total_input_ssim / n,
+    }
+    return overall, summary
 
 
 def main():
@@ -222,12 +238,14 @@ def main():
                                     num_workers=args.workers, pin_memory=device.type == "cuda")
                 result = run_epoch(model, loader, optimizer, scaler, device, train=False)
                 val_results[label] = result
-        real_loss, real_psnr, real_ssim, real_by_condition = val_results["real"]
+        real_metrics, real_by_condition = val_results["real"]
+        real_loss = real_metrics["loss"]
+        real_psnr = real_metrics["psnr"]
+        real_ssim = real_metrics["ssim"]
         if "synthetic" in val_results:
-            syn_loss, syn_psnr, syn_ssim, syn_by_condition = val_results["synthetic"]
+            syn_metrics, syn_by_condition = val_results["synthetic"]
         else:
-            syn_loss = syn_psnr = syn_ssim = None
-            syn_by_condition = {}
+            syn_metrics, syn_by_condition = None, {}
         # Use real validation loss to select the checkpoint; synthetic metrics
         # remain diagnostic and do not dominate model selection.
         selection_loss = real_loss
@@ -235,19 +253,24 @@ def main():
         print(
             f"Epoch {epoch}/{args.epochs} | {elapsed:.1f}s | "
             f"train loss {train_loss:.4f} PSNR {train_psnr:.2f} SSIM {train_ssim:.4f} | "
-            f"REAL val loss {real_loss:.4f} PSNR {real_psnr:.2f} SSIM {real_ssim:.4f}"
+            f"REAL val loss {real_loss:.4f} model PSNR {real_psnr:.2f} SSIM {real_ssim:.4f} | "
+            f"input PSNR {real_metrics['input_psnr']:.2f} SSIM {real_metrics['input_ssim']:.4f}"
         )
-        if syn_loss is not None:
-            print(f"  SYNTHETIC val loss {syn_loss:.4f} PSNR {syn_psnr:.2f} SSIM {syn_ssim:.4f}")
+        if syn_metrics is not None:
+            print(f"  SYNTHETIC val loss {syn_metrics['loss']:.4f} | "
+                  f"model PSNR {syn_metrics['psnr']:.2f} SSIM {syn_metrics['ssim']:.4f} | "
+                  f"input PSNR {syn_metrics['input_psnr']:.2f} SSIM {syn_metrics['input_ssim']:.4f}")
         print("  Real validation by condition:")
         for name, metrics in sorted(real_by_condition.items()):
-            print(f"    {name:18s} L1 {metrics['loss']:.4f} "
-                  f"PSNR {metrics['psnr']:.2f} SSIM {metrics['ssim']:.4f}")
+            print(f"    {name:18s} L1 {metrics['loss']:.4f} | "
+                  f"model PSNR {metrics['psnr']:.2f} SSIM {metrics['ssim']:.4f} | "
+                  f"input PSNR {metrics['input_psnr']:.2f} SSIM {metrics['input_ssim']:.4f}")
         if syn_by_condition:
             print("  Synthetic validation by condition:")
             for name, metrics in sorted(syn_by_condition.items()):
-                print(f"    {name:18s} L1 {metrics['loss']:.4f} "
-                      f"PSNR {metrics['psnr']:.2f} SSIM {metrics['ssim']:.4f}")
+                print(f"    {name:18s} L1 {metrics['loss']:.4f} | "
+                      f"model PSNR {metrics['psnr']:.2f} SSIM {metrics['ssim']:.4f} | "
+                      f"input PSNR {metrics['input_psnr']:.2f} SSIM {metrics['input_ssim']:.4f}")
 
         if selection_loss < best:
             best = selection_loss
@@ -261,10 +284,10 @@ def main():
                 "val_loss": real_loss,
                 "val_psnr": real_psnr,
                 "val_ssim": real_ssim,
+                "real_validation_metrics": real_metrics,
                 "real_validation_by_condition": real_by_condition,
                 "synthetic_validation": {
-                    "loss": syn_loss, "psnr": syn_psnr, "ssim": syn_ssim,
-                    "by_condition": syn_by_condition,
+                    "metrics": syn_metrics, "by_condition": syn_by_condition,
                 },
             }, args.out)
             print(f"  saved best checkpoint (selected on REAL validation) -> {args.out}")
