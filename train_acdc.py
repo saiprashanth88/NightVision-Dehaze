@@ -44,11 +44,26 @@ def edge_loss(x, y):
     return F.l1_loss(gx, gx_t) + F.l1_loss(gy, gy_t)
 
 
-def psnr(x, y):
-    mse = F.mse_loss(x, y).item()
-    if mse <= 1e-12:
-        return 99.0
-    return 10.0 * torch.log10(torch.tensor(1.0 / mse, device=x.device)).item()
+def psnr_per_image(x, y):
+    """Return one PSNR value per image, not one value for the whole batch."""
+    mse = (x - y).pow(2).mean(dim=(1, 2, 3)).clamp_min(1e-12)
+    values = 10.0 * torch.log10(1.0 / mse)
+    return values
+
+
+def ssim_per_image(x, y, window=7):
+    """Return one SSIM value per image using the same local-window formula as ssim_loss."""
+    pad = window // 2
+    mu_x = F.avg_pool2d(x, window, 1, pad)
+    mu_y = F.avg_pool2d(y, window, 1, pad)
+    sigma_x = F.avg_pool2d(x * x, window, 1, pad) - mu_x * mu_x
+    sigma_y = F.avg_pool2d(y * y, window, 1, pad) - mu_y * mu_y
+    sigma_xy = F.avg_pool2d(x * y, window, 1, pad) - mu_x * mu_y
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    score = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / (
+        (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x + sigma_y + c2) + 1e-8
+    )
+    return score.clamp(0, 1).mean(dim=(1, 2, 3))
 
 
 def condition_names(value, batch_size):
@@ -69,7 +84,7 @@ def run_epoch(model, loader, optimizer, scaler, device, train=True, save_dir=Non
         if train:
             optimizer.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+        with torch.amp.autocast(device_type="cuda", enabled=(device.type == "cuda")):
             out = model(x).clamp(0, 1)
             l1 = F.l1_loss(out, y)
             sl = ssim_loss(out, y)
@@ -86,11 +101,11 @@ def run_epoch(model, loader, optimizer, scaler, device, train=True, save_dir=Non
                 optimizer.step()
 
         bs = x.size(0)
-        batch_psnr = psnr(out.detach(), y)
-        batch_ssim = 1.0 - sl.item()
+        per_psnr = psnr_per_image(out.detach(), y)
+        per_ssim = ssim_per_image(out.detach(), y)
         total_loss += loss.item() * bs
-        total_psnr += batch_psnr * bs
-        total_ssim += batch_ssim * bs
+        total_psnr += float(per_psnr.sum().item())
+        total_ssim += float(per_ssim.sum().item())
         n += bs
 
         names = condition_names(condition, bs)
@@ -98,8 +113,8 @@ def run_epoch(model, loader, optimizer, scaler, device, train=True, save_dir=Non
         for i, name in enumerate(names):
             stats = by_condition[name]
             stats["loss"] += float(per_sample_loss[i].item())
-            stats["psnr"] += batch_psnr
-            stats["ssim"] += batch_ssim
+            stats["psnr"] += float(per_psnr[i].item())
+            stats["ssim"] += float(per_ssim[i].item())
             stats["n"] += 1
 
             if save_dir and name not in saved:
@@ -185,7 +200,7 @@ def main():
 
     model = NightDehazeNet(base=24).to(device).float()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     best = float("inf")
