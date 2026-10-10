@@ -165,20 +165,20 @@ def png_bytes(rgb01):
 def show_metric_graphs(stages):
     """Display colorful, aligned PSNR and SSIM bars for the same six pipeline stages."""
     st.markdown("## 📈 PSNR Evaluation")
-    st.caption("Each stage is compared with the final enhanced output. These are similarity-to-final scores, not ground-truth restoration scores.")
+    st.caption("Each bar uses the original uploaded image as the comparison reference. These are input-similarity scores, not ground-truth restoration scores.")
 
     labels = list(stages.keys())
     psnr_values = []
     ssim_values = []
-    reference_u8 = to_uint8(stages["Final Output"])
     for name, stage_img in stages.items():
         stage_u8 = to_uint8(stage_img)
+        reference_u8 = to_uint8(stages["Input"])
         p, s = reference_metrics(stage_u8, reference_u8)
         psnr_values.append(p)
         ssim_values.append(s)
 
-    # Only the final output is identical to the reference, so only that PSNR
-    # is infinite. Cap its bar height for readability; keep the infinity label.
+    # The input compared with itself has infinite PSNR. Cap only its bar height
+    # for readable plotting and label it explicitly as infinity.
     finite_psnr = [v for v in psnr_values if np.isfinite(v)]
     psnr_cap = max(40.0, (max(finite_psnr) + 5.0) if finite_psnr else 40.0)
     psnr_plot = [psnr_cap if not np.isfinite(v) else v for v in psnr_values]
@@ -221,13 +221,13 @@ def show_metric_graphs(stages):
     draw_stage_chart(
         psnr_plot,
         "PSNR across processing stages",
-        "PSNR (dB) — similarity to final output",
+        "PSNR (dB) — similarity to original input",
         ["#3498DB", "#5DADE2", "#8E7CC3", "#17A589", "#F39C12", "#27AE60"],
         psnr_labels,
     )
 
     st.markdown("## 📈 SSIM Evaluation")
-    st.caption("SSIM ranges from 0 to 1. A score closer to 1 means the stage image is more structurally similar to the final output.")
+    st.caption("SSIM ranges from 0 to 1. A score closer to 1 means the stage image is more structurally similar to the original input.")
     draw_stage_chart(
         ssim_values,
         "SSIM across processing stages",
@@ -237,9 +237,8 @@ def show_metric_graphs(stages):
         ylim=(0, 1.12),
     )
     st.info(
-        "The Final Output is the reference baseline (SSIM = 1 and PSNR = ∞). The final PSNR bar is visually capped for readability. "
-        "The other stages use their measured similarity to the final output; values are not artificially forced to increase. "
-        "For true dehazing-quality evaluation, compare each stage against a matching clean ground-truth image."
+        "The Input bars are the reference baseline (SSIM = 1 and PSNR = ∞). The PSNR bar for Input is visually capped so the graph remains readable. "
+        "To evaluate true dehazing quality, compare every stage against a corresponding clean ground-truth image."
     )
 
 st.title("🌙 Nighttime Visibility Analysis")
