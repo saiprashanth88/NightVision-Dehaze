@@ -307,14 +307,14 @@ else:
 
             if show_intermediate:
                 columns = st.columns(4)
-                columns[0].image(original_rgb, caption="1. Input image", use_container_width=True)
-                columns[1].image(preprocessed, caption="2. Preprocessing (denoise)", use_container_width=True)
-                columns[2].image(condition["overlay"], caption="3. Condition-analysis visualization", use_container_width=True)
-                columns[3].image(to_uint8(model_out), caption="4. Neural / fallback enhancement stage", use_container_width=True)
+                columns[0].image(original_rgb, caption="1. Input image", width="stretch")
+                columns[1].image(preprocessed, caption="2. Preprocessing (denoise)", width="stretch")
+                columns[2].image(condition["overlay"], caption="3. Condition-analysis visualization", width="stretch")
+                columns[3].image(to_uint8(model_out), caption="4. Neural / fallback enhancement stage", width="stretch")
                 st.markdown("#### Final enhanced output")
                 left, right = st.columns([1.5, 1])
                 with left:
-                    st.image(to_uint8(final), caption="Final output (contrast and sharpening refinement)", use_container_width=True)
+                    st.image(to_uint8(final), caption="Final output (contrast and sharpening refinement)", width="stretch")
                 with right:
                     st.markdown("**Condition indicators**")
                     st.progress(condition["fog_score"], text=f'Fog / haze cue: {condition["fog_score"] * 100:.0f}%')
@@ -323,13 +323,13 @@ else:
                     st.caption("These indicators are simple image-statistic heuristics, not a validated detection model.")
             else:
                 left, right = st.columns(2)
-                left.image(original_rgb, caption="Original input", use_container_width=True)
-                right.image(to_uint8(final), caption="Final enhanced output", use_container_width=True)
+                left.image(original_rgb, caption="Original input", width="stretch")
+                right.image(to_uint8(final), caption="Final enhanced output", width="stretch")
 
             sharp_a, sharp_b, delta = st.columns(3)
             sharp_a.metric("Input sharpness", f"{original_sharp:.2f}")
             sharp_b.metric("Enhancement-stage sharpness", f"{model_sharp:.2f}")
-            sharp_c.metric("Mean pixel change", f"{mean_change:.4f}")
+            delta.metric("Mean pixel change", f"{mean_change:.4f}")
 
             show_metric_graphs(stages, reference=reference)
 
