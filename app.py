@@ -20,6 +20,68 @@ st.set_page_config(
 
 CHECKPOINT = "checkpoints/acdc_v2_best.pth"
 
+GEMINI_STAGE_PROMPTS = {
+    "1 · Visibility preprocessing": (
+        "Enhance this nighttime road photo as a preprocessing demonstration: gently reduce sensor noise, "
+        "balance exposure, preserve natural colors and keep the exact camera view and scene geometry."
+    ),
+    "2 · Haze reduction": (
+        "Edit this nighttime road photo to reduce visible atmospheric fog and haze while retaining realistic "
+        "nighttime lighting, the same road layout, lane markings, vehicles, signs and buildings."
+    ),
+    "3 · Low-light recovery": (
+        "Improve visibility in underexposed regions of this nighttime road photo. Lift dark road and roadside "
+        "details naturally, preserve headlight highlights, and do not add or move objects."
+    ),
+    "4 · Glare control": (
+        "Reduce excessive headlight bloom and bright glare in this nighttime road photo while preserving "
+        "realistic light sources, vehicle positions, lane markings, and the original scene composition."
+    ),
+    "5 · Detail clarity": (
+        "Improve perceived local contrast and edge clarity in this nighttime road photo without creating "
+        "halos, oversharpening, changing object identities, or inventing hidden details."
+    ),
+    "6 · Demo final composite": (
+        "Create a natural-looking visibility-enhanced version of this exact nighttime road photograph. "
+        "Balance haze reduction, low-light visibility, highlight control and fine detail. Preserve camera "
+        "viewpoint, road geometry, lane markings, vehicles, signs and buildings. Do not add, remove, duplicate "
+        "or relocate objects. This is a visual demo edit, not scientific ground-truth restoration."
+    ),
+}
+
+
+def get_gemini_api_key():
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+    except Exception:
+        return ""
+
+
+def generate_gemini_stage_image(image_bytes, prompt, api_key):
+    """Generate one optional Gemini image-edit preview; never changes the trained-model pipeline."""
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    source_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    response = client.models.generate_content(
+        model="gemini-3.1-flash-image",
+        contents=[
+            prompt + " Return an edited image only. Preserve the source aspect ratio where possible.",
+            source_image,
+        ],
+        config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
+    )
+    for part in response.parts:
+        if getattr(part, "inline_data", None) is not None:
+            raw = part.inline_data.data
+            if raw:
+                return np.array(Image.open(io.BytesIO(raw)).convert("RGB"))
+    raise RuntimeError("Gemini returned no image. Check model access, API quota, and billing.")
+
 
 @st.cache_resource
 def load_model():
@@ -121,43 +183,6 @@ def classic_enhancement(rgb, strength=0.45):
     alpha = float(np.clip(strength, 0, 1))
     out = cv2.addWeighted(rgb, 1.0 - alpha, sharp, alpha, 0)
     return to_float(out)
-
-
-def local_crystal_enhancement(rgb, strength=0.75):
-    """Free local OpenCV enhancement: luminance CLAHE, adaptive gamma, denoising and unsharp masking.
-
-    This improves perceived visibility but cannot recover scene details that are absent from the input.
-    """
-    src = np.asarray(rgb, dtype=np.uint8)
-    lab = cv2.cvtColor(src, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-
-    # Improve local contrast without aggressively changing color.
-    clahe = cv2.createCLAHE(
-        clipLimit=2.0 + 0.8 * float(np.clip(strength, 0, 1)),
-        tileGridSize=(8, 8),
-    )
-    enhanced_l = clahe.apply(l)
-
-    # Adaptive gamma: brighten darker images while keeping highlights controlled.
-    mean_luma = float(np.mean(enhanced_l)) / 255.0
-    gamma = float(np.clip(1.0 - (0.48 - mean_luma) * 0.72, 0.62, 1.0))
-    lut = np.array([round(((i / 255.0) ** gamma) * 255) for i in range(256)], dtype=np.uint8)
-    enhanced_l = cv2.LUT(enhanced_l, lut)
-
-    contrast_rgb = cv2.cvtColor(cv2.merge((enhanced_l, a, b)), cv2.COLOR_LAB2RGB)
-
-    # Gentle color-preserving denoise before detail sharpening.
-    denoised = cv2.bilateralFilter(contrast_rgb, d=5, sigmaColor=22, sigmaSpace=22)
-    sigma = 1.15
-    soft = cv2.GaussianBlur(denoised, (0, 0), sigmaX=sigma)
-    amount = 0.65 + 0.55 * float(np.clip(strength, 0, 1))
-    sharpened = cv2.addWeighted(denoised, 1.0 + amount, soft, -amount, 0)
-
-    # Blend with the original to limit halos and unnatural texture.
-    alpha = 0.55 + 0.35 * float(np.clip(strength, 0, 1))
-    result = cv2.addWeighted(src, 1.0 - alpha, sharpened, alpha, 0)
-    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 def postprocess_image(rgb01, strength=0.45):
@@ -343,10 +368,14 @@ with st.sidebar:
     strength = st.slider("Post-processing strength", 0.0, 1.0, 0.45, 0.05)
     show_intermediate = st.checkbox("Show all processing stages", value=True)
     st.markdown("---")
-    st.subheader("Free local enhancement")
-    use_local_preview = st.checkbox("Show local clarity-enhanced preview", value=True)
-    local_strength = st.slider("Local enhancement strength", 0.0, 1.0, 0.75, 0.05, key="local_enhancement_strength")
-    st.caption("Runs on your computer with OpenCV. No API key or per-image API charge is needed.")
+    st.subheader("Temporary Gemini demo layer")
+    use_gemini_demo = st.checkbox("Enable Gemini stage renders", value=False)
+    gemini_api_key = get_gemini_api_key()
+    if use_gemini_demo and not gemini_api_key:
+        st.warning("Set GEMINI_API_KEY in your environment or Streamlit secrets to enable Gemini renders.")
+    st.caption("Optional image-generation demo only. The trained model and its outputs remain unchanged.")
+    if use_gemini_demo:
+        st.warning("Gemini image-generation models may be paid-only; check your Google AI Studio/API billing before generating. Each selected stage makes a separate image request.")
 
 uploads = st.file_uploader(
     "Upload nighttime / foggy / rainy / snowy road images",
@@ -376,21 +405,55 @@ else:
         condition = condition_analysis(original_rgb)
 
         with st.expander(f"Image {index + 1}: {uploaded.name}", expanded=(index == 0)):
-            if use_local_preview:
-                with st.spinner("Applying free local clarity enhancement..."):
-                    local_preview = local_crystal_enhancement(original_rgb, local_strength)
-                st.markdown("### Local Clarity-Enhanced Preview")
-                st.caption("OpenCV processing runs locally and preserves the original image dimensions. Compare carefully for halos or amplified noise in very dark areas.")
-                preview_left, preview_right = st.columns(2)
-                preview_left.image(original_rgb, caption="Original input", width="stretch")
-                preview_right.image(local_preview, caption="Local enhanced preview", width="stretch")
-                st.download_button(
-                    "Download local enhanced preview",
-                    data=cv2.imencode(".png", cv2.cvtColor(local_preview, cv2.COLOR_RGB2BGR))[1].tobytes(),
-                    file_name=f"{os.path.splitext(uploaded.name)[0]}_local_enhanced.png",
-                    mime="image/png",
-                    key=f"local_preview_download_{index}_{uploaded.name}",
+            if use_gemini_demo and gemini_api_key:
+                st.markdown("### Temporary Gemini visual demonstration")
+                st.caption("These are separately prompted AI image edits for presentation. They are not internal activations or outputs from the trained CNN + Transformer model.")
+                stage_key = __import__("hashlib").sha256(uploaded.getvalue()).hexdigest()
+                cache = st.session_state.setdefault("gemini_stage_demo_cache", {})
+                cache.setdefault(stage_key, {})
+                selected_stages = st.multiselect(
+                    "Choose demo stages to generate",
+                    options=list(GEMINI_STAGE_PROMPTS.keys()),
+                    default=["6 · Demo final composite"],
+                    key=f"gemini_stages_{index}_{stage_key[:8]}",
+                    help="Each selected stage triggers one image-generation request. Start with only the final composite to limit usage.",
                 )
+                if st.button("Generate selected Gemini stage images", key=f"generate_gemini_{index}_{stage_key[:8]}"):
+                    for stage_name in selected_stages:
+                        if stage_name not in cache[stage_key]:
+                            with st.spinner(f"Generating {stage_name}..."):
+                                try:
+                                    cache[stage_key][stage_name] = {
+                                        "image": generate_gemini_stage_image(
+                                            uploaded.getvalue(), GEMINI_STAGE_PROMPTS[stage_name], gemini_api_key
+                                        ),
+                                        "error": None,
+                                    }
+                                except Exception as exc:
+                                    cache[stage_key][stage_name] = {"image": None, "error": str(exc)}
+                                    break
+                generated = cache[stage_key]
+                for stage_name in selected_stages:
+                    if stage_name not in generated:
+                        continue
+                    item = generated[stage_name]
+                    st.markdown(f"**{stage_name}**")
+                    if item["image"] is not None:
+                        source_col, result_col = st.columns(2)
+                        source_col.image(original_rgb, caption="Original input", width="stretch")
+                        result_col.image(item["image"], caption="Gemini demo render", width="stretch")
+                        png = cv2.imencode(
+                            ".png", cv2.cvtColor(item["image"], cv2.COLOR_RGB2BGR)
+                        )[1].tobytes()
+                        st.download_button(
+                            f"Download {stage_name}",
+                            data=png,
+                            file_name=f"{os.path.splitext(uploaded.name)[0]}_{stage_name.split('·')[0].strip().replace(' ', '_').lower()}.png",
+                            mime="image/png",
+                            key=f"gemini_download_{index}_{stage_key[:8]}_{stage_name[:8]}",
+                        )
+                    elif item["error"]:
+                        st.error(f"{stage_name} failed: {item['error']}")
             st.subheader("Nighttime Visibility Analysis")
             st.caption(f"Image size: {original_rgb.shape[1]} × {original_rgb.shape[0]} px")
 
