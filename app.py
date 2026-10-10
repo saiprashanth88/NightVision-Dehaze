@@ -162,87 +162,83 @@ def png_bytes(rgb01):
     return encoded.tobytes() if ok else b""
 
 
-def show_metric_graphs(input_rgb, output_rgb):
-    """Colorful, easy-to-read input-vs-output charts; no sidebar reference upload needed."""
-    st.markdown("## 📊 Input vs. Enhanced Output — Visual Comparison")
+def show_metric_graphs(stages):
+    """Display colorful, aligned PSNR and SSIM bars for the same six pipeline stages."""
+    st.markdown("## 📈 PSNR Evaluation")
+    st.caption("Each bar uses the original uploaded image as the comparison reference. These are input-similarity scores, not ground-truth restoration scores.")
 
-    input01 = to_float(input_rgb)
-    output01 = to_float(output_rgb)
-    before = image_metrics(input01)
-    after = image_metrics(output01)
+    labels = list(stages.keys())
+    psnr_values = []
+    ssim_values = []
+    for name, stage_img in stages.items():
+        stage_u8 = to_uint8(stage_img)
+        reference_u8 = to_uint8(stages["Input"])
+        p, s = reference_metrics(stage_u8, reference_u8)
+        psnr_values.append(p)
+        ssim_values.append(s)
 
-    # Extra interpretable image statistics.
-    before_gray = cv2.cvtColor(input_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-    after_gray = cv2.cvtColor(output_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-    before_brightness = float(before_gray.mean())
-    after_brightness = float(after_gray.mean())
-    before_contrast = float(before_gray.std())
-    after_contrast = float(after_gray.std())
-    before_saturation = float(cv2.cvtColor(input_rgb, cv2.COLOR_RGB2HSV)[:, :, 1].mean())
-    after_saturation = float(cv2.cvtColor(output_rgb, cv2.COLOR_RGB2HSV)[:, :, 1].mean())
+    # The input compared with itself has infinite PSNR. Cap only its bar height
+    # for readable plotting and label it explicitly as infinity.
+    finite_psnr = [v for v in psnr_values if np.isfinite(v)]
+    psnr_cap = max(40.0, (max(finite_psnr) + 5.0) if finite_psnr else 40.0)
+    psnr_plot = [psnr_cap if not np.isfinite(v) else v for v in psnr_values]
+    psnr_labels = ["∞" if not np.isfinite(v) else f"{v:.1f}" for v in psnr_values]
 
-    labels = ["Input", "Enhanced output"]
-    palette = ["#3498db", "#2ecc71"]
-
-    left, right = st.columns(2)
-    with left:
-        fig, ax = plt.subplots(figsize=(6.2, 3.8))
-        bars = ax.bar(labels, [before["Sharpness (Laplacian variance)"], after["Sharpness (Laplacian variance)"]], color=palette, width=0.58)
-        ax.set_title("Sharpness comparison", fontweight="bold")
-        ax.set_ylabel("Laplacian variance")
-        ax.grid(axis="y", alpha=0.25)
-        ax.bar_label(bars, fmt="%.2f", padding=4, fontsize=9)
+    def draw_stage_chart(values, title, ylabel, color, value_labels, ylim=None):
+        fig, ax = plt.subplots(figsize=(12.8, 4.5))
+        x = np.arange(len(labels))
+        bars = ax.bar(x, values, color=color, width=0.68, edgecolor="white", linewidth=0.8)
+        ax.set_title(title, loc="left", fontsize=17, fontweight="bold", color="#17365D", pad=14)
+        ax.set_ylabel(ylabel, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=0, ha="center", fontsize=9)
+        ax.grid(axis="y", linestyle="--", alpha=0.28)
+        ax.set_axisbelow(True)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        else:
+            ax.set_ylim(0, max(values) * 1.18 if values else 1)
+        for bar, label in zip(bars, value_labels):
+            ax.annotate(
+                label,
+                (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=10,
+                fontweight="bold",
+                color="#17365D",
+            )
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("#FBFCFE")
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
         fig.tight_layout()
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
 
-    with right:
-        fig, ax = plt.subplots(figsize=(6.2, 3.8))
-        bars = ax.bar(labels, [before_contrast, after_contrast], color=palette, width=0.58)
-        ax.set_title("Contrast comparison", fontweight="bold")
-        ax.set_ylabel("Grayscale standard deviation (0–1)")
-        ax.grid(axis="y", alpha=0.25)
-        ax.bar_label(bars, fmt="%.3f", padding=4, fontsize=9)
-        fig.tight_layout()
-        st.pyplot(fig, use_container_width=True)
-        plt.close(fig)
+    draw_stage_chart(
+        psnr_plot,
+        "PSNR across processing stages",
+        "PSNR (dB) — similarity to original input",
+        ["#3498DB", "#5DADE2", "#8E7CC3", "#17A589", "#F39C12", "#27AE60"],
+        psnr_labels,
+    )
 
-    left, right = st.columns(2)
-    with left:
-        fig, ax = plt.subplots(figsize=(6.2, 3.8))
-        bars = ax.bar(labels, [before_brightness, after_brightness], color=["#f39c12", "#8e44ad"], width=0.58)
-        ax.set_title("Brightness comparison", fontweight="bold")
-        ax.set_ylabel("Mean grayscale brightness (0–1)")
-        ax.set_ylim(0, 1)
-        ax.grid(axis="y", alpha=0.25)
-        ax.bar_label(bars, fmt="%.3f", padding=4, fontsize=9)
-        fig.tight_layout()
-        st.pyplot(fig, use_container_width=True)
-        plt.close(fig)
-
-    with right:
-        fig, ax = plt.subplots(figsize=(6.2, 3.8))
-        bars = ax.bar(labels, [before_saturation, after_saturation], color=["#e67e22", "#16a085"], width=0.58)
-        ax.set_title("Color saturation comparison", fontweight="bold")
-        ax.set_ylabel("Mean HSV saturation (0–255)")
-        ax.grid(axis="y", alpha=0.25)
-        ax.bar_label(bars, fmt="%.1f", padding=4, fontsize=9)
-        fig.tight_layout()
-        st.pyplot(fig, use_container_width=True)
-        plt.close(fig)
-
-    # These scores describe similarity between output and input, not correctness
-    # against a clean ground-truth image.
-    similarity_psnr, similarity_ssim = reference_metrics(output_rgb, input_rgb)
-    st.markdown("### Input–output similarity")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("PSNR (output vs input)", f"{similarity_psnr:.2f} dB")
-    c2.metric("SSIM (output vs input)", f"{similarity_ssim:.3f}")
-    c3.metric("Brightness change", f"{after_brightness - before_brightness:+.3f}")
-    st.caption(
-        "PSNR and SSIM here compare the enhanced result with the original input only. "
-        "They measure how much the image changed, not whether the restored image is objectively correct. "
-        "Ground-truth restoration-quality evaluation requires a matching clean reference image."
+    st.markdown("## 📈 SSIM Evaluation")
+    st.caption("SSIM ranges from 0 to 1. A score closer to 1 means the stage image is more structurally similar to the original input.")
+    draw_stage_chart(
+        ssim_values,
+        "SSIM across processing stages",
+        "SSIM (0–1)",
+        ["#3498DB", "#5DADE2", "#8E7CC3", "#17A589", "#F39C12", "#27AE60"],
+        [f"{v:.2f}" for v in ssim_values],
+        ylim=(0, 1.12),
+    )
+    st.info(
+        "The Input bars are the reference baseline (SSIM = 1 and PSNR = ∞). The PSNR bar for Input is visually capped so the graph remains readable. "
+        "To evaluate true dehazing quality, compare every stage against a corresponding clean ground-truth image."
     )
 
 st.title("🌙 Nighttime Visibility Analysis")
@@ -323,12 +319,17 @@ else:
                     guarded = False
                     method_label = "OpenCV classical enhancement fallback"
 
-                final = postprocess_image(model_out, strength)
+                # Expose six clearly named, reproducible visual stages.
+                condition_visual = to_float(condition["overlay"])
+                feature_fusion = np.clip(0.75 * model_out + 0.25 * pre01, 0.0, 1.0)
+                final = postprocess_image(feature_fusion, strength)
                 stages = {
                     "Input": original01,
-                    "Preprocessed": pre01,
-                    "CNN + Attention + Transformer" if model is not None and "fallback" not in method_label.lower() else "Enhancement stage": model_out,
-                    "Final output": final,
+                    "Preprocessing": pre01,
+                    "Condition Analysis": condition_visual,
+                    "CNN + ViT": model_out,
+                    "Feature Fusion": feature_fusion,
+                    "Final Output": final,
                 }
 
             st.markdown(f"**Processing method:** {method_label}")
@@ -363,7 +364,7 @@ else:
             sharp_b.metric("Enhancement-stage sharpness", f"{model_sharp:.2f}")
             delta.metric("Mean pixel change", f"{mean_change:.4f}")
 
-            show_metric_graphs(original_rgb, to_uint8(final))
+            show_metric_graphs(stages)
 
             st.download_button(
                 "Download final enhanced image",
